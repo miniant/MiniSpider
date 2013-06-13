@@ -1,4 +1,5 @@
 MiniSpider
 ==========
 
-A simple spider using jsoup
+A simple spider using jsoup.
+druid
