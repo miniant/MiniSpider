@@ -1,0 +1,399 @@
+package net.ant.app.task;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+
+import javax.annotation.Resource;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import com.empyrean.etv.app.pojo.Module;
+import com.empyrean.etv.app.pojo.News;
+import com.empyrean.etv.app.pojo.Picture;
+import com.empyrean.etv.app.service.ModuleService;
+import com.empyrean.etv.app.service.NewsService;
+import com.empyrean.etv.app.service.PictureService;
+import com.empyrean.etv.app.type.Status;
+import com.empyrean.etv.core.task.Processor;
+import com.empyrean.etv.core.util.CollectorUtil;
+import com.empyrean.etv.core.util.Configuration;
+import com.empyrean.etv.core.util.ContextUtil;
+import com.empyrean.etv.core.util.FileUtil;
+import com.empyrean.etv.core.util.IdGenerator;
+
+/**
+ * 基础处理器
+ * 
+ * @author lsr
+ * @version 2013-4-24
+ */
+@Service("baseProcessor")
+public abstract class BaseProcessor implements Processor {
+    private static Log log = LogFactory.getLog(BaseProcessor.class);
+    @Resource
+    protected NewsService newsService;
+
+    @Resource
+    protected ModuleService moduleService;
+    protected Module module;
+
+    @Resource
+    protected PictureService pictureService;
+    
+    @Scheduled(fixedDelay = 2 * 60 * 60 * 1000)
+    public void process() {
+        if(ready()){
+            log.info(module.getId() + " begin.");
+            
+            Document doc = CollectorUtil.getDocument(module.getUrl());
+            if (doc != null){
+                List<Element> linkEles = getLinksFromDoc(doc);
+                for (Element linkEle : linkEles)
+                    collect(linkEle);
+            }
+            
+            log.info(module.getId() + " end.");
+        }
+    }
+    
+    protected boolean ready(){
+        module = null;
+        module = getModule();
+        return (module != null
+              &&  CollectorUtil.isNotEmpty(module.getUrl())
+              && Status.VALID.value() == module.getStatus());
+    }
+    
+    /**
+     * 获取各网站的模块
+     * 
+     * @return
+     */
+    public abstract Module getModule();
+
+    /**
+     * 从doc中获取url链接的元素列表
+     * 
+     * @param doc
+     * @return
+     */
+    public abstract List<Element> getLinksFromDoc(Document doc);
+
+    /**
+     * 采集
+     * 
+     * @param linkEle
+     */
+    private void collect(Element linkEle) {
+        String linkHref = linkEle.attr("href");
+        if (!linkHref.startsWith("http")){
+            String url = getModule().getUrl();
+            if(!url.endsWith("/"))
+                url = url.substring(0, url.lastIndexOf("/"));
+            linkHref = url + linkHref; 
+        }
+        
+        if (hasIgnoredUrl(linkHref))
+            return;
+        if (newsService.isExist(linkHref))
+            return;
+
+        String title = linkEle.text();
+        if(CollectorUtil.isEmpty(title) 
+                || title.contains("全文")
+                || title.contains("详细"))
+            return;
+        
+        getNews(title, linkHref);
+    }
+
+    /**
+     * 是否包含被忽略的url
+     * 
+     * @param url
+     * @return
+     */
+    public abstract boolean hasIgnoredUrl(String url);
+
+    /**
+     * 获取新闻
+     * 
+     * @param linkTitle
+     * @param url
+     */
+    private void getNews(String linkTitle, String url) {
+        Document newsDoc = CollectorUtil.getDocument(url);
+        if (newsDoc == null)
+            return;
+
+        String title = getTitle(linkTitle, newsDoc);
+
+        StringBuffer content = new StringBuffer();
+        StringBuffer imgUrls = new StringBuffer();
+        List<Picture> pictures = new ArrayList<Picture>();
+
+        List<String> pageUrls = getPageUrls(url, newsDoc);
+        for (String pageUrl : pageUrls) {
+            if (!pageUrl.startsWith("http")){
+//                pageUrl = getModule().getUrl() + pageUrl; 
+                if(pageUrl.startsWith("/")){
+                    String moduleUrl = module.getUrl();
+                    pageUrl = moduleUrl.substring(0, moduleUrl.lastIndexOf("/")) + pageUrl;
+                }else
+                    pageUrl = url.substring(0, url.lastIndexOf("/")+1) + pageUrl;
+            }
+            
+            
+            
+            
+            Document pageDoc = CollectorUtil.getDocument(pageUrl);
+            if (pageDoc == null)
+                //continue;
+                break;
+            // 过滤含有视频的
+            if( hasVideo(pageDoc))
+                break;// 直接退出抓取这个分页新闻
+
+            globalFilter(pageDoc);
+            privateFilter(pageDoc);
+
+            String imgCssQuery = getImgCssQuery();
+            List<Picture> picList = getImages(pageDoc, url, imgCssQuery);
+            pictures.addAll(picList);
+
+            for (Picture pic : picList) {
+                String imgUrl = pic.getRepository();
+                if (CollectorUtil.isNotEmpty(imgUrl))
+                    imgUrls.append(imgUrl).append("#");
+            }
+
+            String contentCssQuery = getContentCssQuery();
+            String c = getContent(pageDoc, contentCssQuery);
+            if (CollectorUtil.isNotEmpty(c))
+                content.append(c);
+        }
+
+        if (CollectorUtil.isNotEmpty(title) 
+                && CollectorUtil.isNotEmpty(content.toString())) {
+            News news = News.createDefaultInstance();
+            news.setAuthor(getFrom(newsDoc));
+            news.setPublishTime(getPublishDate(newsDoc));
+            news.setContent(content.toString());
+            news.setOriginUrl(url);
+            news.setImages(imgUrls.toString());
+            news.setPictures(pictures);
+            news.setTitle(title);
+            news.setType(getModule().getId());
+            news.setSite(getModule().getSiteId());
+            newsService.addNews(news);
+        }
+    }
+    
+    /**
+     * 是否含有视频
+     * @param pageDoc
+     * @return
+     */
+    protected boolean hasVideo(Document pageDoc){
+        Elements eles = pageDoc.select(getContentCssQuery());
+        
+        return eles.contains("embed")
+                || eles.contains("object")
+                || eles.contains(".video")
+                || eles.contains("[class=relativeVideo clearfix]")
+                || eles.contains(".artical-player-wrap");
+    }
+
+    /**
+     * 全局过滤
+     * 
+     * @param newsDoc
+     */
+    private void globalFilter(Document newsDoc) {
+        // 去样式
+        newsDoc.select("div").removeAttr("style");
+        newsDoc.select("p").removeAttr("style").removeAttr("class").removeAttr("align");
+        newsDoc.select("img").removeAttr("id").removeAttr("alt").removeAttr("style").removeAttr("class");
+        newsDoc.select("span").removeAttr("style");
+        newsDoc.select("script").remove();
+        newsDoc.select("link").remove();
+        newsDoc.select("style").remove();
+        newsDoc.select("iframe").remove();
+        newsDoc.select("select").remove();
+        newsDoc.select("embed").remove();
+        newsDoc.select("font").removeAttr("size").removeAttr("class").removeAttr("style").removeAttr("color");
+        newsDoc.select(getContentCssQuery() + " a").removeAttr("class").removeAttr("href");
+        
+    }
+
+    /**
+     * 各自的私有过滤
+     * @param newsDoc
+     */
+    public abstract void privateFilter(Document newsDoc);
+
+    /**
+     * 获取标题
+     * @param linkTitle
+     * @param newsDoc
+     * @return
+     */
+    public abstract String getTitle(String linkTitle, Document newsDoc);
+
+    /**
+     * 获取发布日期
+     * @param newsDoc
+     * @return
+     */
+    public abstract Date getPublishDate(Document newsDoc);
+
+    /**
+     * 获取来源
+     * @param newsDoc
+     * @return
+     */
+    public abstract String getFrom(Document newsDoc);
+
+    /**
+     * 获取新闻的所有分页地址
+     * @param url
+     * @param newsDoc
+     * @return
+     */
+    public abstract List<String> getPageUrls(String url, Document newsDoc);
+
+    /**
+     * 获取每页的图片
+     * @param newsDoc
+     * @param url
+     * @param imgCssQuery
+     * @return
+     */
+    private List<Picture> getImages(Document newsDoc, String url, String imgCssQuery) {
+        if (newsDoc == null)
+            return null;
+
+        // 处理图片
+        Elements imgEls = newsDoc.select(imgCssQuery);
+
+        List<Picture> pictures = new ArrayList<Picture>();
+
+        for (Element ele : imgEls) {
+            String imgname = ele.attr("src");
+            if (!imgname.startsWith("http://")){
+                if(imgname.startsWith("/")){
+                    String moduleUrl = module.getUrl();
+                    imgname = moduleUrl.substring(0, moduleUrl.lastIndexOf("/")) + imgname;
+                }
+                else
+                    imgname = url.substring(0, url.lastIndexOf("/")+1) + imgname;
+            }
+            String fileName = IdGenerator.generateId() + "." + FileUtil.getFileSuffix(imgname);
+            String localPath = "fileUpload" + File.separator + fileName;
+            String path = ContextUtil.getContextPath() + localPath;
+            Picture pic = new Picture();
+            try {
+                Map<String, Integer> picInfo = FileUtil.uploadImg(imgname, path);
+                pic = getPicture(localPath, picInfo);
+                pictures.add(pic);
+                ele.removeAttr("src").removeAttr("style");
+                ele.attr("src", localPath);
+                
+                Configuration config = Configuration.getInstance();
+                String imageWidth = config.getValue("imageWidth");
+                int maxWidth = Integer.parseInt(imageWidth);
+                if(maxWidth <= 0)
+                    maxWidth = 1000;
+                    
+                double width = pic.getWidth();
+                int height = pic.getHeight();
+                
+                // 防止图片过大无法完全显示
+                if(width >= maxWidth ){
+                    height = (int)(maxWidth/width * height);
+                    width = maxWidth;
+                    ele.attr("height", String.valueOf(height));
+                    ele.attr("width", String.valueOf(width));
+                }else{
+                    ele.removeAttr("height");
+                    ele.removeAttr("width");
+                }
+                
+            } catch (Exception e) {
+                log.warn("保存图片出现异常(" + imgname + ")：" + e);
+                pictures.remove(pic);
+                ele.removeAttr("src");
+                continue; 
+            }
+        }
+
+        return pictures;
+    }
+
+    
+    /**
+     * 获取图片
+     * @param localPath 本地文件目录
+     * @param picInfo 图片信息
+     * @return
+     */
+    private Picture getPicture(String localPath, Map<String, Integer> picInfo) {
+        Picture pic = new Picture();
+        pic.setId(IdGenerator.generateId());
+        int width = picInfo.get("width");
+        int height = picInfo.get("height");
+        pic.setWidth(width);
+        pic.setHeight(height);
+        pic.setSize(picInfo.get("size"));
+        pic.setRepository(localPath);
+        pic.setHorizontal(width > height);
+        return pic;
+    }
+
+    /**
+     * 获取当前文档的内容
+     * @param newsDoc
+     * @param contentCssQuery 内容的CSS查询语句
+     * @return
+     */
+    private String getContent(Document newsDoc, String contentCssQuery) {
+        if (newsDoc == null)
+            return null;
+
+        StringBuffer content = new StringBuffer();
+        Elements pps = newsDoc.select(contentCssQuery);
+        // 去除正文中的样式
+        pps.select("*")
+        .removeAttr("class").removeAttr("style")
+        .removeAttr("sizcache").removeAttr("sizset")
+        .removeAttr("bgcolor").removeAttr("font");
+        // 去掉非img的高度和宽度
+        pps.select("*").not("img").removeAttr("height").removeAttr("width");
+        
+        for (Element ee : pps)
+            content.append(ee.html());
+
+        return content.toString().replaceAll("�", "");
+    }
+
+    /**
+     * 获取图片的CSS查询语句
+     * @return
+     */
+    public abstract String getImgCssQuery();
+    /**
+     * 获取正文内容的CSS查询语句
+     * @return
+     */
+    public abstract String getContentCssQuery();
+
+}
